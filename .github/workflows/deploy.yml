@@ -1,105 +1,121 @@
 name: mern-marketplace-build-deploy-verify
 
 on:
-  workflow_dispatch:
   push:
     branches: [main]
+  workflow_dispatch: {}
 
 env:
   AWS_REGION: ap-south-1
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/mern-marketplace
-  INSTANCE_ID: i-0bd9cad8485cd0392
-  PUBLIC_URL: http://13.234.150.98
+  EC2_INSTANCE_ID: i-0bd9cad8485cd0392
+  SECURITY_GROUP_ID: sg-06d89ee18d5040608
+  IAM_INSTANCE_PROFILE: mern-marketplace-instance-profile
+  IAM_ROLE: mern-marketplace-ec2-role
   SECRETS_MANAGER_ID: deptic/mern-marketplace/secrets
-  CONTAINER_PORT: 8000
+  CONTAINER_PORT: "8000"
+  HOST_PORT: "80"
+  PUBLIC_URL: http://13.234.150.98
+  DOCKERFILE_PATH: .
 
 jobs:
-  build-and-push:
-    name: Build diagnostics and push image to ECR
+  build:
+    name: Build diagnostics + Docker image to ECR
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.meta.outputs.IMAGE_TAG }}
-      image_uri: ${{ steps.meta.outputs.IMAGE_URI }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 13 (engines from package.json)
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: 13
 
-      - name: Build diagnostics - install dependencies and bundle client/server
+      - name: Build diagnostics (toolchain + repo topology)
         run: |
           set -e
-          echo "=== Node/NPM versions ==="
+          echo "=== node/npm versions (expect node 13.12.0 / npm 6.14.4) ==="
           node --version
           npm --version
-          echo "=== npm install ==="
-          npm install --no-audit --no-fund
-          echo "=== Webpack production build (client + server bundles into dist/) ==="
-          npm run build || echo "::warning::webpack build reported issues; continuing with diagnostics"
-          echo "=== dist/ contents ==="
-          ls -la dist/ || true
-          echo "=== package.json scripts ==="
-          node -e "console.log(JSON.stringify(require('./package.json').scripts, null, 2))"
+          echo "=== package.json scripts / engines / entrypoint ==="
+          node -e "const p=require('./package.json');console.log('name:',p.name,'version:',p.version);console.log('main:',p.main);console.log('scripts:',JSON.stringify(p.scripts,null,2));console.log('engines:',JSON.stringify(p.engines))"
+          echo "=== repository layout ==="
+          ls -la
+          echo "--- client/ ---"; ls client
+          echo "--- server/ ---"; ls server
+          echo "--- config/ ---"; ls config
+          echo "=== webpack entrypoints referenced by npm run build ==="
+          grep -n "entry" webpack.config.client.production.js webpack.config.server.js || true
+          grep -n "output" -A 4 webpack.config.client.production.js webpack.config.server.js || true
 
-      - name: Ensure Docker build context files exist
+      - name: Install dependencies (npm 6 legacy peer deps)
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: Production webpack build (client bundle + SSR server bundle)
+        run: npm run build
+
+      - name: Verify build artifacts (dist/bundle.js + dist/server.generated.js)
         run: |
           set -e
-          if [ ! -f Dockerfile ]; then
-            echo "Dockerfile missing from repository root; generating runtime Dockerfile from evidence"
-            cat > Dockerfile << 'DOCKERFILE'
-          FROM node:13-alpine
-          WORKDIR /app
-          COPY package.json ./
-          RUN npm install --production --no-audit --no-fund
-          COPY . .
-          RUN npm run build || true
-          EXPOSE 8000
-          CMD ["npm", "run", "start"]
-          DOCKERFILE
-          fi
-          if [ ! -f .dockerignore ]; then
-            printf '%s\n' node_modules dist data npm-debug.log .git > .dockerignore
-          fi
+          ls -la dist
+          test -f dist/server.generated.js && echo "dist/server.generated.js OK"
+          test -f dist/bundle.js && echo "dist/bundle.js OK"
 
-      - name: Set up Docker Buildx
+      - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Compute image tag and URI
+      - name: Compute image tag/URI and login to ECR (AWS CLI, static credentials)
         id: meta
         run: |
-          IMAGE_TAG="$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::8}"
-          IMAGE_URI="$ECR_REPOSITORY_URI:$IMAGE_TAG"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
-          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+          set -e
+          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
+          IMAGE_TAG="$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
+          FULL_IMAGE="$ECR_REPOSITORY_URI:$IMAGE_TAG"
+          echo "registry=$ECR_REGISTRY"
+          echo "image=$FULL_IMAGE"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
 
-      - name: AWS CLI - login to ECR with static credentials
-        run: |
-          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REPOSITORY_URI"
-
-      - name: Build image and push to ECR
+      - name: Build Docker image (multi-stage production Dockerfile at repo root)
         run: |
           set -e
-          docker build -t "$IMAGE_URI" -t "$ECR_REPOSITORY_URI:latest" .
-          docker push "$IMAGE_URI"
-          docker push "$ECR_REPOSITORY_URI:latest"
-          echo "Pushed $IMAGE_URI"
+          docker build -t "${{ steps.meta.outputs.image_uri }}" -t "${ECR_REPOSITORY_URI}:latest" -f Dockerfile "$DOCKERFILE_PATH"
 
-  deploy-to-ec2:
-    name: Deploy container to EC2 via SSM
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    steps:
-      - name: AWS CLI - ensure deployment tag env
+      - name: Image diagnostics (exposed port + CMD)
         run: |
-          echo "IMAGE_URI=$ECR_REPOSITORY_URI:${{ needs.build-and-push.outputs.image_tag }}" >> "$GITHUB_ENV"
+          docker image inspect "${{ steps.meta.outputs.image_uri }}" \
+            --format 'ExposedPorts={{json .Config.ExposedPorts}} Cmd={{json .Config.Cmd}} User={{.Config.User}} Workdir={{.Config.WorkingDir}}'
+
+      - name: Push image to ECR
+        run: |
+          set -e
+          docker push "${{ steps.meta.outputs.image_uri }}"
+          docker push "${ECR_REPOSITORY_URI}:latest"
+
+  deploy:
+    name: Deploy to EC2 Docker host via SSM
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy diagnostics (target topology from execution contract)
+        run: |
+          echo "region=$AWS_REGION"
+          echo "instance=$EC2_INSTANCE_ID"
+          echo "ecr=$ECR_REPOSITORY_URI"
+          echo "security_group=$SECURITY_GROUP_ID profile=$IAM_INSTANCE_PROFILE role=$IAM_ROLE"
+          echo "secrets_manager=$SECRETS_MANAGER_ID"
+          echo "container_port=$CONTAINER_PORT host_port=$HOST_PORT"
+          echo "image=${{ needs.build.outputs.image_uri }}"
+          aws sts get-caller-identity || true
 
       - name: Write SSM commands payload to JSON file
         run: |
@@ -109,71 +125,71 @@ jobs:
               "set -e",
               "export AWS_REGION=ap-south-1",
               "export ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "export IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/mern-marketplace:${{ needs.build-and-push.outputs.image_tag }}",
+              "export IMAGE_URI=${{ needs.build.outputs.image_uri }}",
+              "export SECRETS_MANAGER_ID=deptic/mern-marketplace/secrets",
               "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
+              "SECRETS_JSON=$(aws secretsmanager get-secret-value --secret-id $SECRETS_MANAGER_ID --region $AWS_REGION --query SecretString --output text)",
+              "MONGO_URI=$(echo \"$SECRETS_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"MONGO_URI\", d.get(\"mongoUri\", d.get(\"MONGODB_URI\", \"\"))))')",
+              "JWT_SECRET=$(echo \"$SECRETS_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"JWT_SECRET\", d.get(\"jwtSecret\", \"\")))')",
+              "STRIPE_TEST_SECRET_KEY=$(echo \"$SECRETS_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"STRIPE_TEST_SECRET_KEY\", d.get(\"stripeSecretKey\", \"\")))')",
               "docker stop app || true",
               "docker rm app || true",
-              "ENV_JSON=$(aws secretsmanager get-secret-value --secret-id deptic/mern-marketplace/secrets --region ap-south-1 --query SecretString --output text)",
-              "BACKEND_PORT=$(echo \"$ENV_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"BACKEND_PORT\",\"8000\"))')",
-              "JWT_SECRET=$(echo \"$ENV_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"JWT_SECRET\",\"\"))')",
-              "MONGO_URI=$(echo \"$ENV_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"MONGO_URI\",\"\"))')",
-              "PORT=$(echo \"$ENV_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"PORT\",\"8000\"))')",
-              "STRIPE_TEST_SECRET_KEY=$(echo \"$ENV_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"STRIPE_TEST_SECRET_KEY\",\"\"))')",
-              "docker run -d --restart always --name app -p 80:8000 -e PORT=$PORT -e BACKEND_PORT=$BACKEND_PORT -e MONGO_URI=$MONGO_URI -e JWT_SECRET=$JWT_SECRET -e STRIPE_TEST_SECRET_KEY=$STRIPE_TEST_SECRET_KEY $IMAGE_URI"
+              "docker run -d --restart always --name app -p 80:8000 -e NODE_ENV=production -e PORT=8000 -e MONGO_URI=\"$MONGO_URI\" -e JWT_SECRET=\"$JWT_SECRET\" -e STRIPE_TEST_SECRET_KEY=\"$STRIPE_TEST_SECRET_KEY\" $IMAGE_URI",
+              "for i in $(seq 1 30); do if curl -sf -o /dev/null http://localhost:80/; then echo 'container healthy on host port 80'; exit 0; fi; sleep 2; done",
+              "echo 'container failed to become healthy'; docker logs app || true; exit 1"
             ]
           }
           SSMPARAMS
+          python3 -m json.tool /tmp/ssm-params.json > /dev/null && echo "ssm payload is valid JSON"
 
-      - name: AWS CLI - send SSM command to EC2 instance
+      - name: Send SSM command to EC2 instance
         run: |
+          set -e
           COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
+            --instance-ids "$EC2_INSTANCE_ID" \
             --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
+          echo "COMMAND_ID=$COMMAND_ID"
           echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
-          echo "Sent SSM command $COMMAND_ID to $INSTANCE_ID"
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION"
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" \
+            --query "Status" --output text)
+          echo "ssm status=$STATUS"
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" \
+            --query "StandardOutputContent" --output text || true
+          if [ "$STATUS" != "Success" ]; then echo "SSM command failed"; exit 1; fi
 
-      - name: AWS CLI - wait for SSM command success
-        run: |
-          aws ssm wait command-executed \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --region "$AWS_REGION"
-          STATUS=$(aws ssm list-command-invocations \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query "CommandInvocations[0].Status" --output text)
-          echo "SSM command status: $STATUS"
-          if [ "$STATUS" != "Success" ]; then
-            aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$AWS_REGION" \
-              --query "StandardErrorContent" --output text || true
-            exit 1
-          fi
-
-  verify-health:
-    name: Verify production health over HTTP
+  verify:
+    name: Verify production health (HTTP 200 only)
     runs-on: ubuntu-latest
-    needs: deploy-to-ec2
+    needs: deploy
     steps:
       - name: Health check public URL until HTTP 200
         run: |
-          echo "Waiting for $PUBLIC_URL to return HTTP 200"
+          set -e
+          echo "probing $PUBLIC_URL (host port 80 -> container port 8000, SSR Express + Socket.io)"
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /tmp/health.html -w "%{http_code}" "$PUBLIC_URL" || true)
-            echo "Attempt $i: HTTP $CODE"
+            CODE=$(curl -s -o /tmp/health-body.html -w '%{http_code}' "$PUBLIC_URL/" || true)
+            echo "attempt $i -> HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              echo "Health check passed with HTTP 200"
-              head -c 500 /tmp/health.html || true
+              echo "health check passed with HTTP 200"
+              head -c 400 /tmp/health-body.html || true
               exit 0
             fi
-            sleep 10
+            sleep 5
           done
-          echo "Health check failed: no HTTP 200 received"
+          echo "health check failed: never received HTTP 200"
           exit 1
+
+      - name: Verify SSR payload + deployment summary
+        run: |
+          set -e
+          grep -qi '<div id="root"' /tmp/health-body.html && echo "SSR root element present"
+          echo "deployed image: ${{ needs.build.outputs.image_uri }}"
+          echo "public_url: $PUBLIC_URL"
+          echo "instance: $EC2_INSTANCE_ID region: $AWS_REGION"
