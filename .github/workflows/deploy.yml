@@ -1,208 +1,193 @@
-name: Build & Deploy to EC2 Docker
+name: mern-marketplace-build-deploy-verify
 
 on:
   push:
-    branches: ["main"]
-  workflow_dispatch:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REPOSITORY: mern-marketplace
-  INSTANCE_ID: i-0bd9cad8485cd0392
-  SERVER_NAME: mern-marketplace-server
-  PUBLIC_IP: 13.234.150.98
-  TARGET_PORT: 8000
-  DOCKERFILE_PATH: .
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/mern-marketplace
+  EC2_INSTANCE_ID: i-0bd9cad8485cd0392
+  CONTAINER_PORT: "8000"
+  PUBLIC_URL: http://13.234.150.98
+  SECRETS_MANAGER_ID: deptic/mern-marketplace/secrets
 
 jobs:
-  deploy:
-    name: Build, Push and Deploy
+  build:
+    name: Build diagnostics and webpack production bundles
     runs-on: ubuntu-latest
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Login to Amazon ECR
-        id: login-ecr
+      - name: Setup Node.js 13 (engines from package.json)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 13
+
+      - name: Build diagnostics
         run: |
           set -e
-          # Direct AWS CLI ECR login - no action, no OIDC
-          aws ecr get-login-password --region ${ env.AWS_REGION } | docker login --username AWS --password-stdin ${ secrets.AWS_ACCOUNT_ID }.dkr.ecr.${ env.AWS_REGION }.amazonaws.com
-          echo "registry=${ secrets.AWS_ACCOUNT_ID }.dkr.ecr.${ env.AWS_REGION }.amazonaws.com" >> $GITHUB_OUTPUT
+          echo "=== Node / npm versions ==="
+          node --version
+          npm --version
+          echo "=== package.json engines ==="
+          node -e "console.log(JSON.stringify(require('./package.json').engines, null, 2))"
+          echo "=== Repository tree (top level) ==="
+          ls -la
+          echo "=== Client entrypoints ==="
+          ls -la client/main.js client/App.js
+          echo "=== Server entrypoint ==="
+          ls -la server/server.js
+          echo "=== Webpack configs ==="
+          ls -la webpack.config.client.production.js webpack.config.server.js
 
-      - name: Build, tag, and push Docker image to ECR
-        id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      - name: Install dependencies (legacy peer deps for Node 13 toolchain)
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: Run production build (client bundle + SSR server bundle)
+        run: npm run build
+
+      - name: Verify build artifacts
         run: |
           set -e
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          echo "Building $FULL_IMAGE:latest from context: ."
-          docker build --tag "$FULL_IMAGE:$GITHUB_SHA" --tag "$FULL_IMAGE:latest" .
-          docker push "$FULL_IMAGE:$GITHUB_SHA"
-          docker push "$FULL_IMAGE:latest"
-          echo "full_image=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "=== dist listing ==="
+          ls -la dist
+          test -f dist/server.generated.js || { echo "MISSING dist/server.generated.js"; exit 1; }
+          test -f dist/bundle.js || { echo "MISSING dist/bundle.js (client bundle)"; exit 1; }
+          echo "Build artifacts OK"
 
-      - name: Deploy to EC2 via SSM
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+  deploy:
+    name: Deploy to EC2 Docker via ECR and SSM
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 13 (engines from package.json)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 13
+
+      - name: Install dependencies and build (needed for Docker build context validation)
+        run: |
+          npm install --legacy-peer-deps --no-audit --no-fund
+          npm run build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Amazon ECR (direct AWS CLI, static credentials)
         run: |
           set -e
-          # Explicitly export AWS credentials for AWS CLI in this step
-          export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
-          export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
-          export AWS_DEFAULT_REGION="$AWS_DEFAULT_REGION"
-          export AWS_REGION="$AWS_DEFAULT_REGION"
-          # Use literal env vars from workflow/job env (no ${ env.VAR } here!)
-          AWS_REGION="$AWS_REGION"
-          INSTANCE_ID="$INSTANCE_ID"
-          SERVER_NAME="$SERVER_NAME"
-          ECR_REGISTRY="${ECR_REGISTRY:-759204735992.dkr.ecr.ap-south-1.amazonaws.com}"
-          REPO="mern-marketplace"
-          SECRET_ID="deptic/mern-marketplace/secrets"
-          FULL_IMAGE="$ECR_REGISTRY/$REPO:latest"
-          TARGET_PORT="$TARGET_PORT"
+          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
+          PASSWORD=$(aws ecr get-login-password --region "$AWS_REGION")
+          echo "$PASSWORD" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          echo "ECR login OK for $ECR_REGISTRY"
 
-          # Dynamic resolution: If INSTANCE_ID is missing or stopped, locate active instance by tag
-          if [ -z "$INSTANCE_ID" ] || ! aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null | grep -q "running"; then
-            echo "==> Resolving active EC2 instance by tag Name=$SERVER_NAME..."
-            RESOLVED_ID=$(aws ec2 describe-instances --region "$AWS_REGION" \
-              --filters "Name=tag:Name,Values=$SERVER_NAME" "Name=instance-state-name,Values=running" \
-              --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
-            if [ -n "$RESOLVED_ID" ] && [ "$RESOLVED_ID" != "None" ]; then
-              echo "==> Found running instance: $RESOLVED_ID"
-              INSTANCE_ID="$RESOLVED_ID"
-            fi
-          fi
+      - name: Build and push Docker image
+        run: |
+          set -e
+          IMAGE_TAG="${GITHUB_SHA}"
+          FULL_IMAGE="${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
+          LATEST_IMAGE="${ECR_REPOSITORY_URI}:latest"
+          docker build -t "$FULL_IMAGE" -t "$LATEST_IMAGE" -f Dockerfile .
+          docker push "$FULL_IMAGE"
+          docker push "$LATEST_IMAGE"
+          echo "Pushed $FULL_IMAGE and $LATEST_IMAGE"
 
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "==> ERROR: No running EC2 instance found for $SERVER_NAME in $AWS_REGION."
-            exit 1
-          fi
+      - name: Retrieve runtime secrets from AWS Secrets Manager
+        run: |
+          set -e
+          SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRETS_MANAGER_ID" --region "$AWS_REGION" --query SecretString --output text)
+          MONGO_URI=$(echo "$SECRET_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const s=JSON.parse(d);process.stdout.write(s.MONGO_URI||s.mongoUri||'')})")
+          JWT_SECRET=$(echo "$SECRET_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const s=JSON.parse(d);process.stdout.write(s.JWT_SECRET||s.jwtSecret||'')})")
+          STRIPE_TEST_SECRET_KEY=$(echo "$SECRET_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const s=JSON.parse(d);process.stdout.write(s.STRIPE_TEST_SECRET_KEY||s.stripe_test_secret_key||'')})")
+          {
+            echo "MONGO_URI<<EOFMONGO"
+            echo "$MONGO_URI"
+            echo "EOFMONGO"
+            echo "JWT_SECRET<<EOFJWT"
+            echo "$JWT_SECRET"
+            echo "EOFJWT"
+            echo "STRIPE_TEST_SECRET_KEY<<EOFSTRIPE"
+            echo "$STRIPE_TEST_SECRET_KEY"
+            echo "EOFSTRIPE"
+          } >> "$GITHUB_ENV"
+          echo "Secrets retrieved from Secrets Manager"
 
-          echo "==> Waiting for SSM agent on instance $INSTANCE_ID in $AWS_REGION..."
-          PING="Offline"
-          for i in $(seq 1 36); do
-            PING=$(aws ssm describe-instance-information \
-              --region "$AWS_REGION" \
-              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-              --query "InstanceInformationList[0].PingStatus" \
-              --output text 2>/dev/null || true)
-            echo "SSM Ping [$i/36]: $PING"
-            if [ "$PING" = "Online" ]; then
-              break
-            fi
-            sleep 10
-          done
-
-          if [ "$PING" != "Online" ]; then
-            echo "==> SSM agent is not Online (status: $PING). Checking if instance is still booting..."
-            aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || true
-            echo "==> Aborting deploy due to SSM agent unreachable."
-            exit 1
-          fi
-
-          # Write the SSM command payload to a JSON file — this avoids
-          # ALL shell quoting issues from embedding a JSON array of
-          # double-quoted strings inside a double-quoted CLI argument.
-          cat > /tmp/ssm-params.json << SSMPARAMS
+      - name: Send SSM command to EC2 instance (pull and run container)
+        run: |
+          set -e
+          IMAGE_URI="${ECR_REPOSITORY_URI}:${GITHUB_SHA}"
+          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
-              "echo '==> Synchronizing cloud-init provisioning...' && (cloud-init status --wait 2>/dev/null || true)",
-              "systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true",
-              "until docker info > /dev/null 2>&1; do sleep 2; done",
-              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $FULL_IMAGE",
-              "docker stop app 2>/dev/null || true",
-              "docker rm app 2>/dev/null || true",
-              "aws secretsmanager get-secret-value --region $AWS_REGION --secret-id $SECRET_ID --query SecretString --output text | python3 -c \"import sys,json; [print(k, v, sep=chr(61)) for k, v in json.load(sys.stdin).items()]\" > /home/ubuntu/app.env 2>/dev/null || touch /home/ubuntu/app.env",
-              "# Determine container port from image metadata or use TARGET_PORT",
-              "CONTAINER_PORT=$(docker inspect $FULL_IMAGE --format '{{json .Config.ExposedPorts}}' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(list(d.keys())[0].split('/')[0]) if d else '$TARGET_PORT'\" 2>/dev/null || echo $TARGET_PORT)",
-              "echo "==> Container exposes port: $CONTAINER_PORT"",
-              "docker run -d --restart always -p 80:$CONTAINER_PORT -e HOSTNAME=0.0.0.0 --env-file /home/ubuntu/app.env --name app $FULL_IMAGE",
-              "sleep 5",
-              "echo "==> Verifying container is running..."",
-              "docker ps --filter name=app --format 'table {{.Names}}	{{.Status}}	{{.Ports}}'",
-              "echo "==> Testing container health internally..."",
-              "for i in $(seq 1 10); do sleep 3; if curl -sf http://localhost:$CONTAINER_PORT/ >/dev/null 2>&1 || curl -sf http://localhost:$CONTAINER_PORT/health >/dev/null 2>&1; then echo "==> Container health check PASSED on port $CONTAINER_PORT"; break; fi; done",
-              "echo "==> Final container status:"",
-              "docker ps --filter name=app --format 'table {{.Names}}	{{.Status}}	{{.Ports}}'"
+              "set -e",
+              "export AWS_DEFAULT_REGION=ap-south-1",
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "docker pull IMAGE_URI_PLACEHOLDER",
+              "docker stop app || true",
+              "docker rm app || true",
+              "docker run -d --restart always --name app -p 80:8000 -e NODE_ENV=production -e PORT=8000 -e MONGO_URI=MONGO_URI_PLACEHOLDER -e JWT_SECRET=JWT_SECRET_PLACEHOLDER -e STRIPE_TEST_SECRET_KEY=STRIPE_PLACEHOLDER IMAGE_URI_PLACEHOLDER"
             ]
           }
           SSMPARAMS
-
-          echo "==> Sending SSM deployment command to instance $INSTANCE_ID..."
-          CMD_ID=$(aws ssm send-command \
-            --region "$AWS_REGION" \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" \
-            --output text)
-          echo "SSM CommandId: $CMD_ID"
-
-          echo "==> Polling command status..."
-          for i in $(seq 1 36); do
-            sleep 5
-            STATUS=$(aws ssm get-command-invocation \
-              --region "$AWS_REGION" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" \
-              --output text 2>/dev/null || true)
-            echo "Status [$i/36]: $STATUS"
-            if [ "$STATUS" = "Success" ]; then
-              echo "==> Deployment successfully finished on instance!"
-              exit 0
-            fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-              echo "==> SSM Command Failed!"
-              aws ssm get-command-invocation \
-                --region "$AWS_REGION" \
-                --command-id "$CMD_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --query "StandardErrorContent" \
-                --output text 2>/dev/null || true
-              exit 1
-            fi
-          done
-          echo "==> Timed out waiting for SSM command execution."
-          exit 1
-
-      - name: Verify Live Application Health
-        run: |
-          echo "==> Verifying live service health on public endpoint..."
-          # Use literal env vars from workflow env (no ${ env.VAR } in job env block!)
-          PROBE_HOST="$${PUBLIC_IP:-13.234.150.98}"
-          TARGET_PORT="$${TARGET_PORT:-8000}"
-          if [ -z "$PROBE_HOST" ] || [ "$PROBE_HOST" = "None" ]; then
-            echo "==> No public IP or domain configured; skipping external HTTP probe."
-            exit 0
-          fi
-
-          echo "==> Probing http://$PROBE_HOST/ (host port 80)..."
-          # Longer retries: 30 attempts × 10s = 5 minutes for full container startup
-          for h in $(seq 1 30); do
+          sed -i "s|IMAGE_URI_PLACEHOLDER|${IMAGE_URI}|g" /tmp/ssm-params.json
+          sed -i "s|MONGO_URI_PLACEHOLDER|${MONGO_URI}|g" /tmp/ssm-params.json
+          sed -i "s|JWT_SECRET_PLACEHOLDER|${JWT_SECRET}|g" /tmp/ssm-params.json
+          sed -i "s|STRIPE_PLACEHOLDER|${STRIPE_TEST_SECRET_KEY}|g" /tmp/ssm-params.json
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$EC2_INSTANCE_ID" --region "$AWS_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
+          echo "COMMAND_ID=$COMMAND_ID"
+          echo "Waiting for SSM command completion..."
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" --query Status --output text || echo "Pending")
+            echo "SSM status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then echo "SSM command succeeded"; exit 0; fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then echo "SSM command failed with status $STATUS"; exit 1; fi
             sleep 10
-            # Try both root and /health paths like internal check
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$PROBE_HOST/" 2>/dev/null || true)
-            if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "301" ] && [ "$HTTP_CODE" != "302" ]; then
-              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$PROBE_HOST/health" 2>/dev/null || true)
-            fi
-            echo "Health probe [$h/30]: HTTP $HTTP_CODE"
-            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ] || [ "$HTTP_CODE" = "302" ]; then
-              echo "==> Live health check PASSED (HTTP $HTTP_CODE) at http://$PROBE_HOST/"
+          done
+          echo "SSM command timed out"; exit 1
+
+  verify:
+    name: Verify deployment health over public URL
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health check public URL (HTTP 200 required)
+        run: |
+          set -e
+          echo " probing ${PUBLIC_URL} "
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /tmp/health-body -w "%{http_code}" "${PUBLIC_URL}/" || true)
+            echo "Attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "Health check passed with HTTP 200"
+              head -c 300 /tmp/health-body || true
               exit 0
             fi
+            sleep 10
           done
-          echo "==> Live health check FAILED after 5 minutes. Last HTTP code: $HTTP_CODE"
+          echo "Health check failed: never received HTTP 200"
           exit 1
+
+      - name: Verify API endpoints respond
+        run: |
+          set -e
+          CODE_SHOPS=$(curl -s -o /dev/null -w "%{http_code}" "${PUBLIC_URL}/api/shops" || true)
+          CODE_PRODUCTS=$(curl -s -o /dev/null -w "%{http_code}" "${PUBLIC_URL}/api/products/latest" || true)
+          echo "GET /api/shops -> $CODE_SHOPS"
+          echo "GET /api/products/latest -> $CODE_PRODUCTS"
+          if [ "$CODE_SHOPS" = "200" ] && [ "$CODE_PRODUCTS" = "200" ]; then
+            echo "API verification passed"
+          else
+            echo "API verification failed"
+            exit 1
+          fi
