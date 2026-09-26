@@ -1,11 +1,9 @@
 name: mern-marketplace-build-deploy-verify
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch: {}
 
 env:
   AWS_REGION: ap-south-1
@@ -13,14 +11,18 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/mern-marketplace
   EC2_INSTANCE_ID: i-0bd9cad8485cd0392
-  PUBLIC_URL: http://13.234.150.98
   SECRETS_MANAGER_ID: deptic/mern-marketplace/secrets
-  CONTAINER_PORT: "8000"
+  CONTAINER_PORT: 8000
+  PUBLIC_URL: http://13.234.150.98
+  DOCKERfile_PATH: .
 
 jobs:
   build:
-    name: Build diagnostics and webpack production bundles
+    name: Build diagnostics and Docker image
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,171 +32,126 @@ jobs:
         with:
           node-version: 13
 
-      - name: Build diagnostics
+      - name: Build diagnostics (repository evidence)
         run: |
           set -e
-          echo "=== Node / npm versions ==="
+          echo "--- node/npm versions ---"
           node --version
           npm --version
-          echo "=== package.json metadata ==="
-          node -e "const p=require('./package.json'); console.log('name:', p.name); console.log('version:', p.version); console.log('main:', p.main); console.log('engines:', JSON.stringify(p.engines)); console.log('build script:', p.scripts.build); console.log('start script:', p.scripts.start)"
-          echo "=== Repository layout ==="
+          echo "--- package.json scripts ---"
+          node -e "const p=require('./package.json'); console.log(JSON.stringify(p.scripts, null, 2)); console.log('main:', p.main); console.log('engines:', JSON.stringify(p.engines))"
+          echo "--- entrypoint / webpack config presence ---"
           ls -la
-          echo "=== Client entrypoints ==="
-          test -f client/main.js && echo "client/main.js present"
-          test -f client/App.js && echo "client/App.js present"
-          echo "=== Server entrypoint ==="
           test -f server/server.js && echo "server/server.js present"
-          echo "=== Webpack configs ==="
+          test -f client/main.js && echo "client/main.js present"
           test -f webpack.config.client.production.js && echo "webpack.config.client.production.js present"
           test -f webpack.config.server.js && echo "webpack.config.server.js present"
+          test -f template.js && echo "template.js present (SSR shell)"
+          test -f config/config.js && echo "config/config.js present"
 
-      - name: Install dependencies (legacy peer deps for React 16 / MUI 4)
+      - name: Install dependencies (legacy peer deps for react-stripe-elements / MUI 4)
         run: npm install --legacy-peer-deps --no-audit --no-fund
 
-      - name: Run production webpack build (client bundle + SSR server bundle)
+      - name: Production webpack build (client bundle + SSR server bundle)
         run: npm run build
 
-      - name: Verify build outputs
+      - name: Verify build artifacts
         run: |
           set -e
-          echo "=== dist contents ==="
-          ls -la dist/
-          test -f dist/server.generated.js && echo "dist/server.generated.js OK"
-          test -f dist/bundle.js && echo "dist/bundle.js OK" || echo "dist/bundle.js not found, listing actual client bundle artifacts"
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: mern-marketplace-dist
-          path: dist/
-
-  deploy:
-    name: Push image to ECR and deploy to EC2 via SSM
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name != 'pull_request'
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js 13 (engines from package.json)
-        uses: actions/setup-node@v4
-        with:
-          node-version: 13
-
-      - name: Install dependencies and rebuild bundles for image context
-        run: |
-          set -e
-          npm install --legacy-peer-deps --no-audit --no-fund
-          npm run build
+          test -f dist/server.generated.js && echo "dist/server.generated.js built"
+          test -f dist/bundle.js && echo "dist/bundle.js built" || true
           ls -la dist/
 
-      - name: Set up Docker Buildx
+      - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Amazon ECR (direct AWS CLI, static credentials)
         run: |
-          set -e
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%/*}"
-          ECR_REPO="${ECR_REPOSITORY_URI#*/}"
-          echo "ECR_REGISTRY=$ECR_REGISTRY"
-          echo "ECR_REPO=$ECR_REPO"
+          ECR_REGISTRY="$(echo "$ECR_REPOSITORY_URI" | cut -d/ -f1)"
           aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-      - name: Build and push Docker image (context ., Dockerfile at repository root)
+      - name: Compute image tag and URI
+        id: meta
+        run: |
+          IMAGE_TAG="${GITHUB_SHA}"
+          FULL_IMAGE="$ECR_REPOSITORY_URI:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "FULL_IMAGE=$FULL_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Build and push Docker image (context ., multi-stage production Dockerfile, port 8000)
+        run: |
+          docker build -t "$FULL_IMAGE" -t "$ECR_REPOSITORY_URI:latest" .
+          docker push "$FULL_IMAGE"
+          docker push "$ECR_REPOSITORY_URI:latest"
+
+  deploy:
+    name: Deploy to EC2 via SSM RunShellScript
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy container to EC2 instance (SSM file-based parameters)
         run: |
           set -e
-          IMAGE_TAG="$(date +%Y%m%d%H%M%S)-${GITHUB_SHA:0:7}"
-          IMAGE_URI="$ECR_REPOSITORY_URI:$IMAGE_TAG"
-          LATEST_URI="$ECR_REPOSITORY_URI:latest"
-          docker buildx build \
-            --file Dockerfile \
-            --tag "$IMAGE_URI" \
-            --tag "$LATEST_URI" \
-            --push \
-            --build-arg NODE_ENV=production \
-            --label "gitSha=$GITHUB_SHA" \
-            --label "buildRun=$GITHUB_RUN_ID" \
-            .
-          echo "Pushed $IMAGE_URI and $LATEST_URI"
-
-      - name: Fetch runtime secrets from AWS Secrets Manager
-        run: |
-          set -e
-          SECRET_JSON="$(aws secretsmanager get-secret-value --secret-id "$SECRETS_MANAGER_ID" --region "$AWS_REGION" --query SecretString --output text)"
-          MONGO_URI="$(echo "$SECRET_JSON" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("MONGO_URI") or d.get("mongoUri") or d.get("MONGO_URL") or "")')"
-          JWT_SECRET="$(echo "$SECRET_JSON" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("JWT_SECRET") or d.get("jwtSecret") or "")')"
-          STRIPE_KEY="$(echo "$SECRET_JSON" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("STRIPE_TEST_SECRET_KEY") or d.get("stripeSecretKey") or "")')"
-          {
-            echo "MONGO_URI=$MONGO_URI"
-            echo "JWT_SECRET=$JWT_SECRET"
-            echo "STRIPE_TEST_SECRET_KEY=$STRIPE_KEY"
-          } >> "$GITHUB_ENV"
-          echo "Runtime secrets loaded from Secrets Manager (values masked in logs)"
-
-      - name: Write SSM command payload to JSON file
-        run: |
-          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          ECR_REGISTRY="$(echo "$ECR_REPOSITORY_URI" | cut -d/ -f1)"
+          IMAGE_URI="$ECR_REPOSITORY_URI:${{ needs.build.outputs.image_tag }}"
+          cat > /tmp/ssm-params.json << SSMPARAMS
           {
             "commands": [
-              "set -e",
-              "export AWS_REGION=ap-south-1",
-              "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/mern-marketplace:latest",
+              "export AWS_REGION=$AWS_REGION",
+              "export ECR_REGISTRY=$ECR_REGISTRY",
+              "export IMAGE_URI=$IMAGE_URI",
               "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always --name app -p 80:8000 -e PORT=8000 -e NODE_ENV=production -e MONGO_URI=\"$MONGO_URI\" -e JWT_SECRET=\"$JWT_SECRET\" -e STRIPE_TEST_SECRET_KEY=\"$STRIPE_TEST_SECRET_KEY\" $IMAGE_URI",
-              "sleep 10",
-              "docker ps --filter name=app"
+              "docker run -d --restart always --name app -p 80:$CONTAINER_PORT --env NODE_ENV=production --env MONGO_URI=$(aws secretsmanager get-secret-value --secret-id $SECRETS_MANAGER_ID --query SecretString --output text | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const s=JSON.parse(d);console.log(s.MONGO_URI||s.mongoUri||"")}') --env JWT_SECRET=$(aws secretsmanager get-secret-value --secret-id $SECRETS_MANAGER_ID --query SecretString --output text | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const s=JSON.parse(d);console.log(s.JWT_SECRET||s.jwtSecret||"")}') $IMAGE_URI"
             ]
           }
           SSMPARAMS
-          echo "SSM parameters file written"
-          cat /tmp/ssm-params.json
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$EC2_INSTANCE_ID" --region "$AWS_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
+          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
+          echo "Sent SSM command: $COMMAND_ID"
 
-      - name: Deploy to EC2 instance via SSM send-command
+      - name: Wait for SSM command completion
         run: |
           set -e
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" --output text)
-          echo "COMMAND_ID=$COMMAND_ID"
-          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION"
-          STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" --query Status --output text)
-          echo "SSM command status: $STATUS"
-          if [ "$STATUS" != "Success" ]; then
-            echo "SSM command failed; output below"
-            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION"
-            exit 1
-          fi
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm list-command-invocations --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" --query "CommandInvocations[0].Status" --output text)
+            echo "SSM status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then echo "SSM command succeeded"; exit 0; fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" || true
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "SSM command timed out"
+          exit 1
 
   verify:
-    name: Health check public endpoint
+    name: Health check public URL
     runs-on: ubuntu-latest
     needs: deploy
-    if: github.event_name != 'pull_request'
     steps:
-      - name: Wait for application startup (SSR server + Socket.io)
+      - name: Wait for app warm-up
         run: sleep 20
 
-      - name: Health check http://13.234.150.98 (must return HTTP 200)
+      - name: HTTP 200 health check against http://13.234.150.98
         run: |
           set -e
-          for i in $(seq 1 15); do
-            CODE=$(curl -s -o /tmp/health.html -w "%{http_code}" http://13.234.150.98/ || true)
-            echo "Attempt $i: HTTP $CODE"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /tmp/health.html -w "%{http_code}" "$PUBLIC_URL/" || true)
+            echo "Attempt $i -> HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              echo "Health check passed"
-              head -c 500 /tmp/health.html || true
+              echo "Health check passed (HTTP 200)"
+              head -c 300 /tmp/health.html || true
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed: never received HTTP 200 from http://13.234.150.98"
+          echo "Health check failed: never received HTTP 200"
           exit 1
